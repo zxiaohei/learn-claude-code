@@ -267,6 +267,36 @@ def agent_loop(messages):
 
 ## 快速开始
 
+### 简单启动（macOS / Linux）
+
+安装 Python 3.10+（推荐 3.11），并在根目录 `.env` 中配置 API Key、
+`MODEL_ID` 和需要的 `ANTHROPIC_BASE_URL` 后，在项目根目录执行：
+
+```sh
+./run                            # 第一章
+./run s08                        # 第八章
+./run s17                        # 第十七章
+./run s01_agent_loop/code.py      # 也可以指定 Python 文件
+./run agents/s_full.py            # 旧版整合脚本
+```
+
+首次运行自动创建 `.venv` 并安装 `requirements.txt` 中的依赖；后续直接复用，
+依赖清单变化时自动重新安装。无需手动激活虚拟环境，也无需单独运行 `pip`。
+脚本固定在项目根目录运行，文件路径相对于项目根目录，后续参数原样传给 Python 文件。
+使用 `./run --help` 查看用法。
+
+### VS Code 断点调试
+
+用 VS Code 打开项目根目录，安装 Microsoft 的 Python 和 Python Debugger 扩展。
+完成上面的首次启动后，打开要调试的 `.py` 文件，在行号左侧点击设置断点，按 F5，
+选择“Python：调试当前文件”；也可以选择“Python：调试 s01”固定启动第一章。
+配置自动使用 `.venv`、根目录 `.env` 和项目根目录作为工作目录。
+
+以 s01 为例，在 `response = client.messages.create(...)` 处设置断点查看请求参数，
+在紧随其后的 `messages.append(...)` 处设置断点查看 `response`。
+出现 `s01 >>` 后，在“终端”输入问题；暂停后，在“调试控制台”输入
+`response.model_dump()` 查看完整返回。使用 F5 继续、F10 单步跳过。
+
 ### 新版 17 章主线
 
 ```sh
