@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-s14: MCP Tools - discover external tools and add them to the agent loop.
+s14：MCP 工具——发现外部工具，并把它们动态加入 Agent Loop。
 
-Run:  python s14_mcp_plugin/code.py
-Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
+运行：python s14_mcp_plugin/code.py
+依赖：pip install anthropic python-dotenv，并在 .env 中配置 API 密钥和模型
+
+本课用进程内对象模拟 MCP server，重点演示 Harness 一侧的职责：连接
+server、发现工具、转换工具定义、执行权限检查，以及把调用结果送回模型。
+真实 MCP 的 stdio / HTTP transport 不在这里实现。
 
     connect_mcp("docs")
               |
@@ -30,17 +34,24 @@ from pathlib import Path
 
 try:
     import readline
+
+    # 不让终端驱动提前吞掉 Ctrl-C 等特殊字符，由下面的输入循环统一处理。
     readline.parse_and_bind("set bind-tty-special-chars off")
 except ImportError:
+    # Windows 等环境可能没有 readline；缺失时只影响命令行编辑体验。
     pass
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+# 课程通过 .env 切换模型或兼容 API，因此让文件配置覆盖已有环境变量。
 load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
+    # 自定义兼容端点通常使用 API key；移除 Claude CLI 遗留的 OAuth token，
+    # 避免 SDK 同时看到两套认证信息。
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
+# 所有文件工具都以启动脚本时的目录为工作区，而不是以脚本目录为准。
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
@@ -51,18 +62,23 @@ BASE_SYSTEM = (
 )
 
 
-# -- From s04: base tools --
+# -- 沿用 s04：基础工具 --
+
 
 def run_bash(command: str) -> str:
+    """在工作区执行 shell 命令，并把有界的文本结果返回给模型。"""
     try:
         result = subprocess.run(
             command,
             shell=True,
             cwd=WORKDIR,
             capture_output=True,
-            text=True, errors="replace",
+            text=True,
+            errors="replace",
             timeout=120,
         )
+        # stdout 和 stderr 合并后都属于工具观察结果；限制长度可防止单次调用
+        # 无限制挤占模型上下文。
         output = (result.stdout + result.stderr).strip()
         output = output[:50000] if output else "(no output)"
         if result.returncode:
@@ -75,6 +91,7 @@ def run_bash(command: str) -> str:
 
 
 def run_read(path: str, limit: int | None = None) -> str:
+    """读取 UTF-8 文本；可按行截断，并明确告诉模型还有多少行。"""
     try:
         lines = (WORKDIR / path).resolve().read_text(encoding="utf-8").splitlines()
         if limit and limit < len(lines):
@@ -85,6 +102,7 @@ def run_read(path: str, limit: int | None = None) -> str:
 
 
 def run_write(path: str, content: str) -> str:
+    """写入 UTF-8 文本，并自动创建尚不存在的父目录。"""
     try:
         target = (WORKDIR / path).resolve()
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -95,6 +113,7 @@ def run_write(path: str, content: str) -> str:
 
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
+    """仅在旧文本恰好出现一次时替换，避免一次请求误改多个位置。"""
     try:
         target = (WORKDIR / path).resolve()
         content = target.read_text(encoding="utf-8")
@@ -108,12 +127,16 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 def run_glob(pattern: str) -> str:
+    """在工作区中展开 glob，并过滤解析后逃出工作区的匹配项。"""
     try:
-        matches = sorted({
-            match
-            for match in glob.glob(pattern, root_dir=WORKDIR, recursive=True)
-            if (WORKDIR / match).resolve().is_relative_to(WORKDIR.resolve())
-        })
+        matches = sorted(
+            {
+                match
+                for match in glob.glob(pattern, root_dir=WORKDIR, recursive=True)
+                if (WORKDIR / match).resolve().is_relative_to(WORKDIR.resolve())
+            }
+        )
+        # 排序和去重让模型在相同文件状态下得到稳定结果；最多返回 200 项。
         shown = matches[:200]
         if len(matches) > 200:
             shown.append("... (more matches omitted; narrow the pattern)")
@@ -122,31 +145,58 @@ def run_glob(pattern: str) -> str:
         return f"Error: {exc}"
 
 
+# 工具由两部分组成：下面的 JSON Schema 告诉模型“怎样调用”，
+# BASE_HANDLERS 则告诉 Python “收到调用后执行哪个函数”。
 BASE_TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object",
-                      "properties": {"command": {"type": "string"}},
-                      "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object",
-                      "properties": {"path": {"type": "string"},
-                                     "limit": {"type": "integer"}},
-                      "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object",
-                      "properties": {"path": {"type": "string"},
-                                     "content": {"type": "string"}},
-                      "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text once.",
-     "input_schema": {"type": "object",
-                      "properties": {"path": {"type": "string"},
-                                     "old_text": {"type": "string"},
-                                     "new_text": {"type": "string"}},
-                      "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files by glob pattern; ** matches recursively.",
-     "input_schema": {"type": "object",
-                      "properties": {"pattern": {"type": "string"}},
-                      "required": ["pattern"]}},
+    {
+        "name": "bash",
+        "description": "Run a shell command.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "read_file",
+        "description": "Read file contents.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}},
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": "Write content to a file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "edit_file",
+        "description": "Replace exact text once.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_text": {"type": "string"},
+                "new_text": {"type": "string"},
+            },
+            "required": ["path", "old_text", "new_text"],
+        },
+    },
+    {
+        "name": "glob",
+        "description": "Find files by glob pattern; ** matches recursively.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"pattern": {"type": "string"}},
+            "required": ["pattern"],
+        },
+    },
 ]
 
 BASE_HANDLERS = {
@@ -158,10 +208,15 @@ BASE_HANDLERS = {
 }
 
 
-# -- New in s14: MCP discovery and dispatch --
+# -- s14 新增：MCP 工具发现与分发 --
+
 
 class MCPClient:
-    """Small in-process stand-in for MCP tools/list and tools/call."""
+    """进程内 MCP client，用最小实现模拟 ``tools/list`` 与 ``tools/call``。
+
+    ``tools`` 保存 server 发现结果，``_handlers`` 模拟 transport 另一端真正
+    执行工具的入口。真实实现会在这里发送协议请求，而不是直接调用函数。
+    """
 
     def __init__(self, name: str):
         self.name = name
@@ -169,6 +224,7 @@ class MCPClient:
         self._handlers: dict[str, callable] = {}
 
     def register(self, tool_defs: list[dict], handlers: dict[str, callable]):
+        """注册一次工具发现结果，并验证每个公开工具都有唯一执行入口。"""
         names = [tool.get("name") for tool in tool_defs]
         if any(not isinstance(name, str) or not name for name in names):
             raise ValueError("Every MCP tool needs a non-empty name")
@@ -177,10 +233,12 @@ class MCPClient:
         missing = [name for name in names if name not in handlers]
         if missing:
             raise ValueError(f"Missing MCP handlers: {', '.join(missing)}")
+        # 复制容器，避免调用方之后增删原列表或字典时悄悄改变 server 状态。
         self.tools = list(tool_defs)
         self._handlers = dict(handlers)
 
     def call_tool(self, tool_name: str, args: dict) -> str:
+        """模拟 ``tools/call``，把失败也编码为可供模型阅读的工具结果。"""
         handler = self._handlers.get(tool_name)
         if not handler:
             return f"MCP error: unknown tool '{tool_name}'"
@@ -190,11 +248,13 @@ class MCPClient:
             return f"MCP error: {type(exc).__name__}: {exc}"
 
 
+# 已连接的 client 是会话级状态；连接成功后，后续模型轮次才能发现其工具。
 mcp_clients: dict[str, MCPClient] = {}
+# 这里按“模型看到的带前缀名称”缓存当前工具池的宿主权限决策。
 mcp_tool_policies: dict[str, str] = {}
 _DISALLOWED_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
 
-# Authorization comes from host configuration, never server descriptions.
+# server 提供的 annotations 只是提示，不能自行授予权限；最终授权来自宿主配置。
 MCP_HOST_POLICY = {
     ("docs", "search"): "allow",
     ("docs", "get_version"): "allow",
@@ -204,7 +264,7 @@ MCP_HOST_POLICY = {
 
 
 def normalize_mcp_name(name: str) -> str:
-    """Replace characters outside the model tool-name alphabet."""
+    """把不属于模型工具名字符集的字符替换成下划线。"""
     normalized = _DISALLOWED_CHARS.sub("_", name)
     if not normalized:
         raise ValueError("MCP names cannot normalize to an empty string")
@@ -212,12 +272,14 @@ def normalize_mcp_name(name: str) -> str:
 
 
 def _mock_server_docs() -> MCPClient:
+    """创建只读文档 server；其定义和 handler 代表 MCP server 端。"""
     server = MCPClient("docs")
     server.register(
         tool_defs=[
             {
                 "name": "search",
                 "description": "Search the documentation.",
+                # MCP 使用 inputSchema；接入模型 API 时会转换成 input_schema。
                 "inputSchema": {
                     "type": "object",
                     "properties": {"query": {"type": "string"}},
@@ -241,6 +303,7 @@ def _mock_server_docs() -> MCPClient:
 
 
 def _mock_server_deploy() -> MCPClient:
+    """创建部署 server，同时展示只读工具和有副作用工具。"""
     server = MCPClient("deploy")
     server.register(
         tool_defs=[
@@ -273,6 +336,7 @@ def _mock_server_deploy() -> MCPClient:
     return server
 
 
+# 工厂表在课程中代替真实的 server 配置与 transport 连接过程。
 MOCK_SERVERS = {
     "docs": _mock_server_docs,
     "deploy": _mock_server_deploy,
@@ -280,11 +344,13 @@ MOCK_SERVERS = {
 
 
 def connect_mcp(name: str) -> str:
+    """连接一个已知 server，缓存 client，并报告本次发现的工具。"""
     if name in mcp_clients:
         return f"MCP server '{name}' already connected"
     factory = MOCK_SERVERS.get(name)
     if not factory:
         return f"Unknown server '{name}'. Available: {', '.join(MOCK_SERVERS)}"
+    # 调用工厂相当于建立连接并完成一次 tools/list。
     server = factory()
     mcp_clients[name] = server
     names = ", ".join(tool["name"] for tool in server.tools)
@@ -296,9 +362,11 @@ def connect_mcp(name: str) -> str:
 
 
 def run_connect_mcp(name: str) -> str:
+    """保持所有工具 handler 都采用可由关键字参数调用的统一接口。"""
     return connect_mcp(name)
 
 
+# connect_mcp 本身是内置工具：模型先用它连接 server，下一轮才会看到新工具。
 CONNECT_TOOL = {
     "name": "connect_mcp",
     "description": "Connect to an MCP server and discover its tools.",
@@ -309,65 +377,75 @@ CONNECT_TOOL = {
     },
 }
 
+# 内置工具始终存在；MCP 工具则根据 mcp_clients 在每轮动态追加。
 BUILTIN_TOOLS = [*BASE_TOOLS, CONNECT_TOOL]
 BUILTIN_HANDLERS = {**BASE_HANDLERS, "connect_mcp": run_connect_mcp}
 
 
 def assemble_tool_pool() -> tuple[list[dict], dict[str, callable]]:
-    """Combine built-in tools with every connected server tool."""
+    """把内置工具和所有已连接 server 的工具组装成当轮工具池。"""
     global mcp_tool_policies
+    # 每轮复制，确保动态追加 MCP 工具时不会污染永久的内置工具表。
     tools = list(BUILTIN_TOOLS)
     handlers = dict(BUILTIN_HANDLERS)
     policies: dict[str, str] = {}
-    origins = {
-        tool["name"]: f"built-in tool {tool['name']!r}"
-        for tool in tools
-    }
+    # 同时记录名称来源，以便规范化后发生碰撞时给出可诊断的信息。
+    origins = {tool["name"]: f"built-in tool {tool['name']!r}" for tool in tools}
 
     for server_name, server in mcp_clients.items():
         safe_server = normalize_mcp_name(server_name)
         for tool_def in server.tools:
             raw_name = tool_def["name"]
             safe_tool = normalize_mcp_name(raw_name)
+            # 前缀既隔离不同 server 的同名工具，也让权限层识别外部调用。
             prefixed = f"mcp__{safe_server}__{safe_tool}"
             if len(prefixed) > 64:
-                raise ValueError(f"MCP tool name is longer than 64 characters: {prefixed}")
+                raise ValueError(
+                    f"MCP tool name is longer than 64 characters: {prefixed}"
+                )
             origin = f"MCP tool {server_name!r}/{raw_name!r}"
             if prefixed in origins:
                 raise ValueError(
                     "MCP tool name collision after normalization: "
                     f"{prefixed!r} maps both {origins[prefixed]} and {origin}"
                 )
+            # 在协议边界校验 server 输入，避免无效 schema 一直传到模型 API。
             schema = tool_def.get("inputSchema", {})
             if not isinstance(schema, dict) or schema.get("type", "object") != "object":
                 raise ValueError(f"Invalid input schema for {origin}")
             origins[prefixed] = origin
-            tools.append({
-                "name": prefixed,
-                "description": tool_def.get("description", ""),
-                "input_schema": schema,
-            })
-            handlers[prefixed] = (
-                lambda *, client=server, tool=raw_name, **kwargs:
+            tools.append(
+                {
+                    "name": prefixed,
+                    "description": tool_def.get("description", ""),
+                    "input_schema": schema,
+                }
+            )
+            # 默认参数在创建 lambda 时冻结当前 server 和原始工具名；若直接引用
+            # 循环变量，所有 handler 最终都会错误地指向最后一个工具。
+            handlers[prefixed] = lambda *, client=server, tool=raw_name, **kwargs: (
                 client.call_tool(tool, kwargs)
             )
-            policies[prefixed] = MCP_HOST_POLICY.get(
-                (server_name, raw_name), "confirm"
-            )
+            # 未显式配置的外部工具默认询问，采用保守的 fail-closed 策略。
+            policies[prefixed] = MCP_HOST_POLICY.get((server_name, raw_name), "confirm")
 
+    # 仅在整个工具池成功组装后发布策略，避免校验中途失败留下半成品状态。
     mcp_tool_policies = policies
     return tools, handlers
 
 
 def assemble_system_prompt() -> str:
+    """把实时连接状态加入系统提示，让模型知道哪些 server 已可用。"""
     if not mcp_clients:
         return BASE_SYSTEM
     return BASE_SYSTEM + "\n\nConnected MCP servers: " + ", ".join(mcp_clients)
 
 
-# -- From s04: hooks and permission checks --
+# -- 沿用 s04：Hooks 与权限检查 --
 
+# Hook 按生命周期分组。一个事件可以注册多个回调，彼此与工具实现解耦。
 HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
+# 明确禁止的命令直接拒绝；可能有破坏性的命令则交给用户确认。
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
 DESTRUCTIVE_COMMAND_WORD = re.compile(
     r"(?i)(?:^|[;&|()\n])\s*(?:rm|del)(?=\s|$|[;&|()])"
@@ -376,14 +454,17 @@ DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
 
 
 def contains_destructive_command(command: str) -> bool:
+    """识别命令边界上的 rm/del，避免把普通单词中的字符误判成命令。"""
     return bool(DESTRUCTIVE_COMMAND_WORD.search(command))
 
 
 def register_hook(event: str, callback):
+    """按注册顺序把回调加入指定生命周期事件。"""
     HOOKS[event].append(callback)
 
 
 def trigger_hooks(event: str, *args):
+    """依次触发回调；首个非 None 结果会短路后续回调。"""
     for callback in HOOKS[event]:
         result = callback(*args)
         if result is not None:
@@ -392,6 +473,7 @@ def trigger_hooks(event: str, *args):
 
 
 def permission_hook(block):
+    """在分发前统一检查 shell、文件路径和 MCP 工具权限。"""
     if block.name == "bash":
         command = block.input.get("command", "")
         for pattern in DENY_LIST:
@@ -404,6 +486,7 @@ def permission_hook(block):
             if input("Allow? [y/N] ").strip().lower() not in {"y", "yes"}:
                 return "Permission denied by user"
 
+    # 工作区外的文件访问并非一律禁止，但必须由用户显式确认。
     if block.name in {"read_file", "write_file", "edit_file"}:
         raw_path = block.input.get("path", "")
         if not (WORKDIR / raw_path).resolve().is_relative_to(WORKDIR.resolve()):
@@ -411,6 +494,7 @@ def permission_hook(block):
             if input("Allow? [y/N] ").strip().lower() not in {"y", "yes"}:
                 return "Permission denied by user"
 
+    # 权限只信任宿主生成的策略，不读取 server 自报的 readOnlyHint。
     if block.name.startswith("mcp__"):
         policy = mcp_tool_policies.get(block.name, "confirm")
         if policy != "allow":
@@ -421,30 +505,32 @@ def permission_hook(block):
 
 
 def log_hook(block):
+    """打印紧凑的调用摘要，避免日志重复输出完整的大参数。"""
     preview = str(list(block.input.values())[:2])[:60]
     print(f"[hook] {block.name}({preview})")
     return None
 
 
 def large_output_hook(block, output):
+    """在工具执行后提示异常大的结果，便于发现上下文膨胀来源。"""
     if len(str(output)) > 100000:
         print(f"[hook] Large output from {block.name}: {len(str(output))} chars")
     return None
 
 
 def context_hook(query: str):
+    """在接收用户输入时显示本轮工具所使用的工作区。"""
     print(f"[hook] UserPromptSubmit: working in {WORKDIR}")
     return None
 
 
 def summary_hook(messages: list):
+    """会话轮次停止时，统计历史中已经返回给模型的工具结果。"""
     tool_count = sum(
         1
         for message in messages
         for block in (
-            message.get("content")
-            if isinstance(message.get("content"), list)
-            else []
+            message.get("content") if isinstance(message.get("content"), list) else []
         )
         if isinstance(block, dict) and block.get("type") == "tool_result"
     )
@@ -452,6 +538,8 @@ def summary_hook(messages: list):
     return None
 
 
+# 注册顺序有语义：permission_hook 可以短路 PreToolUse，使被拒绝的调用
+# 不再进入日志 Hook 和真正的 handler。
 register_hook("UserPromptSubmit", context_hook)
 register_hook("PreToolUse", permission_hook)
 register_hook("PreToolUse", log_hook)
@@ -460,12 +548,15 @@ register_hook("Stop", summary_hook)
 
 
 def execute_tool(block, handlers: dict[str, callable]) -> str:
+    """执行一个 tool_use：前置 Hook → handler → 后置 Hook。"""
     blocked = trigger_hooks("PreToolUse", block)
     if blocked:
         return str(blocked)
     handler = handlers.get(block.name)
     if not handler:
         return f"Unknown tool: {block.name}"
+    # 参数缺失、参数多余以及 handler 内部异常都留在工具边界内返回给模型，
+    # 模型可以在下一轮修正调用，而不必终止整个 Agent Loop。
     try:
         output = str(handler(**block.input))
     except Exception as exc:
@@ -474,11 +565,15 @@ def execute_tool(block, handlers: dict[str, callable]) -> str:
     return output
 
 
-# -- Agent loop with a dynamic tool pool --
+# -- 使用动态工具池的 Agent Loop --
+
 
 def agent_loop(messages: list):
+    """持续调用模型和执行工具，直到模型不再返回 tool_use。"""
     while True:
         try:
+            # 必须每轮重建：上一轮 connect_mcp 改变了已连接 server 集合，
+            # 新发现的工具应从紧接着的下一次模型调用开始可见。
             tools, handlers = assemble_tool_pool()
             response = client.messages.create(
                 model=MODEL,
@@ -488,40 +583,49 @@ def agent_loop(messages: list):
                 max_tokens=8000,
             )
         except Exception as exc:
-            messages.append({
-                "role": "assistant",
-                "content": [{
-                    "type": "text",
-                    "text": f"[Error] {type(exc).__name__}: {exc}",
-                }],
-            })
+            # 工具池校验或模型 API 调用失败时保留错误消息，并正常触发 Stop Hook。
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"[Error] {type(exc).__name__}: {exc}",
+                        }
+                    ],
+                }
+            )
             trigger_hooks("Stop", messages)
             return
 
+        # 先保存完整 assistant 响应，后续 tool_result 才能用 tool_use_id 配对。
         messages.append({"role": "assistant", "content": response.content})
-        tool_calls = [
-            block for block in response.content if block.type == "tool_use"
-        ]
+        tool_calls = [block for block in response.content if block.type == "tool_use"]
         if not tool_calls:
+            # 没有工具调用表示模型已经给出最终回答，本轮循环结束。
             trigger_hooks("Stop", messages)
             return
 
+        # 同一响应可以包含多个 tool_use；全部执行后合成一条 user 消息回传。
         results = []
         for block in tool_calls:
             print(f"> {block.name}")
             output = execute_tool(block, handlers)
             print(output[:300])
-            results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": output,
-            })
+            results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": output,
+                }
+            )
         messages.append({"role": "user", "content": results})
 
 
 if __name__ == "__main__":
     print("s14: MCP tools")
     print("Enter a question, press Enter to send. Type q to quit.\n")
+    # 多次输入共享历史和已连接 MCP client，因此连接只需执行一次。
     history = []
 
     while True:
@@ -534,6 +638,7 @@ if __name__ == "__main__":
         trigger_hooks("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
+        # agent_loop 已把最终 assistant 响应写入 history，这里只负责渲染文本块。
         for block in history[-1].get("content", []):
             if getattr(block, "type", None) == "text":
                 print(block.text)
