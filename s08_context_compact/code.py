@@ -277,13 +277,13 @@ class ContextCompactor:
     """
 
     # 这里用字符数近似 token 数，便于教学且不依赖特定 tokenizer。
-    CONTEXT_CHAR_LIMIT = 6000
+    CONTEXT_CHAR_LIMIT = 50000
     # 单次追加的一批 tool_result 最多允许占用的字符数。
     TOOL_RESULT_BATCH_CHAR_LIMIT = 200000
     # 单条结果超过此值才值得落盘，避免大量小结果产生文件。
-    LARGE_RESULT_CHAR_LIMIT = 1500
+    LARGE_RESULT_CHAR_LIMIT = 30000
     # 发送给摘要模型的历史原文上限；超出时保留头尾、略去中间。
-    SUMMARY_INPUT_CHAR_LIMIT = 8000
+    SUMMARY_INPUT_CHAR_LIMIT = 80000
     # 微压缩时完整保留最近几个“模型已经看过”的工具结果。
     KEEP_RECENT_RESULTS = 3
     # API 报 prompt too long 时，响应式压缩仍完整保留的末尾消息数。
@@ -401,7 +401,7 @@ class ContextCompactor:
         return path
 
     def persisted_preview(self, tool_use_id: str, output: str,
-                          preview_chars: int = 500) -> str:
+                          preview_chars: int = 2000) -> str:
         """返回“完整文件路径 + 开头预览”，必要时先把原文落盘。
 
         如果 output 已经是本类生成的占位文本，就复用原文件并从文件读取预览，
@@ -466,7 +466,7 @@ class ContextCompactor:
         return (path.resolve().is_relative_to(self.transcript_dir.resolve())
                 and path.is_file())
 
-    def snip_compact(self, messages: list, max_messages: int = 12) -> list:
+    def snip_compact(self, messages: list, max_messages: int = 50) -> list:
         """当消息条数过多时归档中间段，只保留开头、标记和最近消息。
 
         这里按“消息条数”而非字符数治理结构性增长。工具调用 assistant 消息与
@@ -553,7 +553,7 @@ class ContextCompactor:
                 break
             output = str(block.get("content", ""))
             replacement = self.persisted_preview(
-                block.get("tool_use_id", "unknown"), output, preview_chars=300)
+                block.get("tool_use_id", "unknown"), output, preview_chars=1000)
             if len(replacement) < len(output):
                 block["content"] = replacement
         return messages
