@@ -9,7 +9,7 @@
       "python": "${workspaceFolder}/.venv/bin/python",
       "cwd": "${workspaceFolder}",
       "envFile": "${workspaceFolder}/.env",
-      "console": "integratedTerminal",
+      "console": "externalTerminal",
       "justMyCode": true
     },
     {
@@ -20,7 +20,7 @@
       "python": "${workspaceFolder}/.venv/bin/python",
       "cwd": "${workspaceFolder}",
       "envFile": "${workspaceFolder}/.env",
-      "console": "integratedTerminal",
+      "console": "externalTerminal",
       "justMyCode": true
     }
   ]
